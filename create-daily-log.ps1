@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 
 try {
     # === CONFIG ===
-    $basePath = "E:\SAPTARSHI BANERJEE\WORKLOGS"    # <-- change this path if you want
+    $basePath = "E:\SAPTARSHI BANERJEE\PERSONAL\PROJECT\OTHERS\WORKLOGS"    # <-- change this path if you want
     $createShortcutOnDesktop = $false
     $iconLocation = ""  # e.g. "C:\Users\You\Pictures\md-icon.ico"
 

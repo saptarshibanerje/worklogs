@@ -9,7 +9,7 @@ Usage:
 #>
 
 param(
-  [string]$WorkLogsBase = "E:\SAPTARSHI BANERJEE\WORKLOGS",
+  [string]$WorkLogsBase = "E:\SAPTARSHI BANERJEE\PERSONAL\PROJECT\OTHERS\WORKLOGS",
   [Parameter(Mandatory = $true)][string]$To,
   [string]$Cc = "",
   [string]$Bcc = "",
@@ -153,7 +153,7 @@ try {
   try { Add-Type -AssemblyName System.Web -ErrorAction Stop } catch {}
 
   $headingRegex = [regex]'^(#{2,6})\s+(.*\S)'
-  $bulletRegex = [regex]'^\s*\-\s*(.+)$'
+  $bulletRegex = [regex]'^\s*(?:-|(?:\d+\.)|[a-zA-Z]\.)\s*(.+)$'
   $sections = @()
   $currentSection = $null
 
@@ -289,6 +289,24 @@ try {
   catch {
     Write-Log ("ERROR updating summary workbook: {0}" -f $_.Exception.Message)
     throw
+  }
+
+  try {
+      Write-Log "Checking for Git changes..."
+      $gitStatus = git status --porcelain
+      if ($gitStatus) {
+          Write-Log "Changes detected. Committing and pushing to Git..."
+          git add .
+          $commitMsg = "Worklog update: $($today.ToString('yyyy-MM-dd'))"
+          git commit -m $commitMsg
+          git push origin main
+          Write-Log "Git push successful."
+      } else {
+          Write-Log "No changes to commit."
+      }
+  }
+  catch {
+      Write-Log ("WARNING: Git operation failed: {0}" -f $_)
   }
 
   Write-Log "=== END no-bullets run (success) ==="

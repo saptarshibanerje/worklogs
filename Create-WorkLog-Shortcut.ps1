@@ -2,7 +2,7 @@
 # This script creates a Desktop shortcut to run your Work Log mail sender
 
 # --- Configuration ---
-$scriptPath   = "E:\SAPTARSHI BANERJEE\WORKLOGS\email-todays-worklog.ps1"
+$scriptPath   = "E:\SAPTARSHI BANERJEE\PERSONAL\PROJECT\OTHERS\WORKLOGS\email-todays-worklog.ps1"
 $recipient    = "siddhesh@ibps.in"   # Default recipient email
 $shortcutName = "Send Work Log"
 # ----------------------
