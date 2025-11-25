@@ -25,34 +25,155 @@ if (-not $SummaryPath) {
 
 $SummaryPath = [System.IO.Path]::GetFullPath($SummaryPath)
 
+$script:RunId = [Guid]::NewGuid().ToString("N").Substring(0, 8)
+
 function Write-Log {
   param($m)
   $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  "$ts`t$m" | Out-File -FilePath $LogFile -Append -Encoding utf8
+  $logDir = Split-Path -Parent $LogFile
+  if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+  }
+  "$ts`t[$script:RunId] $m" | Out-File -FilePath $LogFile -Append -Encoding utf8
   Write-Host $m
 }
 
-function Update-SummaryWorkbook {
+function ConvertTo-DateKey {
+  param([datetime]$Date)
+  return $Date.ToString('yyyy-MM-dd')
+}
+
+function Parse-WorkLogSections {
   param(
-    [string]$Path,
+    [string]$Content
+  )
+
+  $headingRegex = [regex]'^(#{2,6})\s+(.*\S)'
+  $bulletRegex = [regex]'^\s*(?:-|(?:\d+\.)|[a-zA-Z]\.)\s*(.+)$'
+  $sections = New-Object System.Collections.Generic.List[object]
+  $currentSection = $null
+
+  foreach ($rawLine in ($Content -split "`r?`n")) {
+    $trimmed = $rawLine.Trim()
+
+    $headingMatch = $headingRegex.Match($trimmed)
+    if ($headingMatch.Success) {
+      if ($currentSection) { $sections.Add($currentSection) }
+      $currentSection = [PSCustomObject]@{
+        Title = $headingMatch.Groups[2].Value.Trim()
+        Items = New-Object System.Collections.Generic.List[string]
+      }
+      continue
+    }
+
+    if (-not $currentSection) { continue }
+
+    $bulletMatch = $bulletRegex.Match($rawLine)
+    if ($bulletMatch.Success) {
+      $itemText = $bulletMatch.Groups[1].Value.Trim()
+      if ($itemText) { $currentSection.Items.Add($itemText) }
+    }
+  }
+
+  if ($currentSection) { $sections.Add($currentSection) }
+  return $sections
+}
+
+function Get-SectionsFromWorkLogFile {
+  param(
+    [string]$Path
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return $null
+  }
+
+  $content = Get-Content -Raw -LiteralPath $Path -Encoding UTF8
+  if (-not $content) {
+    return @()
+  }
+
+  return (Parse-WorkLogSections -Content $content)
+}
+
+function Convert-SectionsToRecords {
+  param(
     [datetime]$LogDate,
     [System.Collections.Generic.List[object]]$Sections
+  )
+
+  $records = New-Object System.Collections.Generic.List[object]
+  $dateOnly = $LogDate.Date
+  $dateKey = ConvertTo-DateKey -Date $dateOnly
+
+  foreach ($section in $Sections) {
+    $title = [string]$section.Title
+    foreach ($item in $section.Items) {
+      $records.Add([PSCustomObject]@{
+        Date = $dateOnly
+        DateKey = $dateKey
+        Section = $title
+        Entry = [string]$item
+      })
+    }
+  }
+
+  return $records
+}
+
+function Get-WorkLogFileMap {
+  param(
+    [string]$BasePath
+  )
+
+  $map = @{}
+  if (-not (Test-Path -LiteralPath $BasePath)) {
+    return $map
+  }
+
+  $logFiles = Get-ChildItem -Path $BasePath -Recurse -File -Filter "*.md" -ErrorAction SilentlyContinue
+  foreach ($file in $logFiles) {
+    if ($file.Name -match '^(?<date>\d{4}-\d{2}-\d{2})\.md$') {
+      $dateKey = $matches['date']
+      if (-not $map.ContainsKey($dateKey)) {
+        $map[$dateKey] = $file.FullName
+      }
+    }
+  }
+
+  return $map
+}
+
+function Sync-SummaryWorkbook {
+  param(
+    [string]$Path,
+    [datetime]$Today,
+    [System.Collections.Generic.List[object]]$TodaySections,
+    [string]$WorkLogsBase
   )
 
   $excel = $null
   $workbook = $null
   $worksheet = $null
-  $entriesWritten = 0
   $xlUp = -4162
+  $existingDateKeys = New-Object System.Collections.Generic.HashSet[string]
+  $recordsByDate = New-Object 'System.Collections.Generic.SortedDictionary[datetime,System.Collections.Generic.List[pscustomobject]]'
 
   try {
     $excel = New-Object -ComObject Excel.Application
     $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+
+    $summaryDir = Split-Path -Parent $Path
+    if ($summaryDir -and -not (Test-Path -LiteralPath $summaryDir)) {
+      New-Item -ItemType Directory -Path $summaryDir -Force | Out-Null
+    }
 
     $createdNew = $false
 
-  if ((Test-Path -LiteralPath $Path -PathType Leaf) -and ((Get-Item -LiteralPath $Path).Length -gt 0)) {
+    if ((Test-Path -LiteralPath $Path -PathType Leaf) -and ((Get-Item -LiteralPath $Path).Length -gt 0)) {
       try {
+        Write-Log ("Opening existing summary workbook: {0}" -f $Path)
         $workbook = $excel.Workbooks.Open($Path)
       }
       catch {
@@ -62,6 +183,7 @@ function Update-SummaryWorkbook {
 
     if (-not $workbook) {
       $createdNew = $true
+      Write-Log ("Creating new summary workbook at: {0}" -f $Path)
       $workbook = $excel.Workbooks.Add()
     }
 
@@ -88,37 +210,160 @@ function Update-SummaryWorkbook {
       $worksheet.Columns.Item(1).ColumnWidth = 18
       $worksheet.Columns.Item(2).ColumnWidth = 28
       $worksheet.Columns.Item(3).ColumnWidth = 80
+      $worksheet.Columns.Item(1).NumberFormat = "yyyy-mm-dd"
     }
 
     $lastRow = $worksheet.Cells.Item($worksheet.Rows.Count, 1).End($xlUp).Row
-    if ($lastRow -lt 1) { $lastRow = 1 }
-    $currentRow = $lastRow + 1
+    if ($lastRow -gt 1) {
+      $endAddress = "C$lastRow"
+      $dataRange = $worksheet.Range("A2", $endAddress)
+      $data = $dataRange.Value2
 
-    foreach ($section in $Sections) {
-      foreach ($item in $section.Items) {
-        $worksheet.Cells.Item($currentRow, 1).Value2 = $LogDate.ToString('yyyy-MM-dd')
-        $worksheet.Cells.Item($currentRow, 2).Value2 = $section.Title
-        $worksheet.Cells.Item($currentRow, 3).Value2 = $item
-        $currentRow++
-        $entriesWritten++
+      if ($null -ne $data) {
+        if ($data -is [System.Array]) {
+          if ($data.Rank -eq 1) {
+            $cols = $data.Length
+            $matrix = New-Object 'object[,]' 1, $cols
+            for ($c = 0; $c -lt $cols; $c++) {
+              $matrix[0, $c] = $data[$c]
+            }
+            $data = $matrix
+          }
+        }
+        else {
+          $matrix = New-Object 'object[,]' 1, 1
+          $matrix[0, 0] = $data
+          $data = $matrix
+        }
+
+        $rowLower = $data.GetLowerBound(0)
+        $rowUpper = $data.GetUpperBound(0)
+        $colLower = $data.GetLowerBound(1)
+
+        for ($row = $rowLower; $row -le $rowUpper; $row++) {
+          $dateValue = $data.GetValue($row, $colLower)
+          if ($null -eq $dateValue) { continue }
+
+          if ($dateValue -is [double]) {
+            $dateValue = [DateTime]::FromOADate($dateValue)
+          } elseif ($dateValue -is [string]) {
+            try {
+              $dateValue = [DateTime]::Parse($dateValue, [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+            catch {
+              continue
+            }
+          } else {
+            $dateValue = [datetime]$dateValue
+          }
+
+          $sectionValue = $data.GetValue($row, $colLower + 1)
+          $entryValue = $data.GetValue($row, $colLower + 2)
+          $dateOnly = $dateValue.Date
+          $dateKey = ConvertTo-DateKey -Date $dateOnly
+
+          $existingDateKeys.Add($dateKey) | Out-Null
+          if (-not $recordsByDate.ContainsKey($dateOnly)) {
+            $recordsByDate[$dateOnly] = New-Object System.Collections.Generic.List[pscustomobject]
+          }
+
+          $recordsByDate[$dateOnly].Add([pscustomobject]@{
+            Date = $dateOnly
+            DateKey = $dateKey
+            Section = [string]$sectionValue
+            Entry = [string]$entryValue
+          })
+        }
       }
     }
 
-    if ($entriesWritten -eq 0 -and $createdNew) {
+    $todayKey = ConvertTo-DateKey -Date $Today
+    if ($recordsByDate.ContainsKey($Today.Date)) {
+      $removedCount = $recordsByDate[$Today.Date].Count
+      Write-Log ("Removing {0} existing entries for {1} before refresh." -f $removedCount, $todayKey)
+      $recordsByDate.Remove($Today.Date) | Out-Null
+    }
+
+    $fileMap = Get-WorkLogFileMap -BasePath $WorkLogsBase
+    $missingDateKeys = @()
+    foreach ($kvp in $fileMap.GetEnumerator()) {
+      if (-not $existingDateKeys.Contains($kvp.Key)) {
+        $missingDateKeys += $kvp.Key
+      }
+    }
+
+    $missingDateKeys = $missingDateKeys | Sort-Object
+    foreach ($dateKey in $missingDateKeys) {
+      $filePath = $fileMap[$dateKey]
+      Write-Log ("Backfilling summary for {0} from file {1}" -f $dateKey, $filePath)
+      $sections = Get-SectionsFromWorkLogFile -Path $filePath
+      if (-not $sections -or $sections.Count -eq 0) {
+        Write-Log ("No bullet entries found in {0}; skipping backfill." -f $filePath)
+        continue
+      }
+
+      $logDate = [DateTime]::ParseExact($dateKey, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+      $records = Convert-SectionsToRecords -LogDate $logDate -Sections $sections
+      if ($records.Count -eq 0) {
+        Write-Log ("Parsed sections for {0} but found no bullet entries to record." -f $dateKey)
+        continue
+      }
+
+      if (-not $recordsByDate.ContainsKey($logDate.Date)) {
+        $recordsByDate[$logDate.Date] = New-Object System.Collections.Generic.List[pscustomobject]
+      }
+
+      foreach ($record in $records) {
+        $recordsByDate[$logDate.Date].Add($record)
+      }
+
+      $existingDateKeys.Add($dateKey) | Out-Null
+    }
+
+    $todayRecords = Convert-SectionsToRecords -LogDate $Today -Sections $TodaySections
+    Write-Log ("Adding {0} entries for today's log ({1})." -f $todayRecords.Count, $todayKey)
+    $recordsByDate[$Today.Date] = New-Object System.Collections.Generic.List[pscustomobject]
+    foreach ($record in $todayRecords) {
+      $recordsByDate[$Today.Date].Add($record)
+    }
+    $existingDateKeys.Add($todayKey) | Out-Null
+
+    $totalEntries = 0
+    foreach ($kvp in $recordsByDate.GetEnumerator()) {
+      $totalEntries += $kvp.Value.Count
+    }
+
+    Write-Log ("Writing {0} total entries back to summary workbook." -f $totalEntries)
+
+    if ($lastRow -gt 1) {
+      $worksheet.Range("A2", "C$lastRow").ClearContents() | Out-Null
+    }
+
+    if ($totalEntries -gt 0) {
+      $dataArray = New-Object 'object[,]' $totalEntries, 3
+      $rowIndex = 0
+      foreach ($kvp in $recordsByDate.GetEnumerator()) {
+        foreach ($record in $kvp.Value) {
+          $dataArray[$rowIndex, 0] = $record.Date
+          $dataArray[$rowIndex, 1] = $record.Section
+          $dataArray[$rowIndex, 2] = $record.Entry
+          $rowIndex++
+        }
+      }
+
+      $writeRange = $worksheet.Range("A2").Resize($totalEntries, 3)
+      $writeRange.Value2 = $dataArray
+      $writeRange.Columns.Item(1).NumberFormat = "yyyy-mm-dd"
+    }
+
+    if ($createdNew) {
       $workbook.SaveAs($Path, 51)
-      return 0
+    }
+    else {
+      $workbook.Save()
     }
 
-    if ($entriesWritten -gt 0) {
-      if ($createdNew) {
-        $workbook.SaveAs($Path, 51)
-      }
-      else {
-        $workbook.Save()
-      }
-    }
-
-    return $entriesWritten
+    return $totalEntries
   }
   finally {
     if ($worksheet) {
@@ -138,8 +383,8 @@ function Update-SummaryWorkbook {
 }
 
 try {
-  if (Test-Path $LogFile) { Remove-Item $LogFile -ErrorAction SilentlyContinue }
   Write-Log "=== START no-bullets run ==="
+  Write-Log ("Run context -> WorkLogsBase: {0}; SummaryPath: {1}" -f $WorkLogsBase, $SummaryPath)
 
   $today = Get-Date
   $filePath = Join-Path (Join-Path $WorkLogsBase $today.ToString('yyyy')) (Join-Path $today.ToString('MMMM') ($today.ToString('yyyy-MM-dd') + ".md"))
@@ -152,57 +397,37 @@ try {
   $content = Get-Content -Raw -LiteralPath $filePath -Encoding UTF8
   try { Add-Type -AssemblyName System.Web -ErrorAction Stop } catch {}
 
-  $headingRegex = [regex]'^(#{2,6})\s+(.*\S)'
-  $bulletRegex = [regex]'^\s*(?:-|(?:\d+\.)|[a-zA-Z]\.)\s*(.+)$'
-  $sections = @()
-  $currentSection = $null
-
-  foreach ($rawLine in ($content -split "`r?`n")) {
-    $trimmed = $rawLine.Trim()
-
-    $headingMatch = $headingRegex.Match($trimmed)
-    if ($headingMatch.Success) {
-      if ($currentSection) { $sections += $currentSection }
-      $currentSection = [PSCustomObject]@{
-        Title = $headingMatch.Groups[2].Value.Trim()
-        Items = New-Object System.Collections.Generic.List[string]
-      }
-      continue
-    }
-
-    if (-not $currentSection) { continue }
-
-    $bulletMatch = $bulletRegex.Match($rawLine)
-    if ($bulletMatch.Success) {
-      $itemText = $bulletMatch.Groups[1].Value.Trim()
-      if ($itemText) { $currentSection.Items.Add($itemText) }
+  Write-Log "Parsing worklog content for bullet sections..."
+  $sections = Parse-WorkLogSections -Content $content
+  $validSections = New-Object System.Collections.Generic.List[object]
+  foreach ($section in $sections) {
+    if ($section.Items.Count -gt 0) {
+      $validSections.Add($section)
     }
   }
 
-  if ($currentSection) { $sections += $currentSection }
-
-  $validSections = $sections | Where-Object { $_.Items.Count -gt 0 }
-
-  Write-Log ("Sections with content: {0}" -f ($validSections.Count))
+  Write-Log ("Sections with content: {0}" -f $validSections.Count)
+  $sendMail = $true
   if ($validSections.Count -eq 0) {
-    Write-Log "No sections with bullet content found. Nothing to send."
-    exit 0
+    Write-Log "No sections with bullet content found. Email delivery will be skipped, continuing with summary sync."
+    $sendMail = $false
   }
 
   Write-Log ("Summary workbook target: {0}" -f $SummaryPath)
 
-  $sectionHtmlParts = foreach ($section in $validSections) {
-    $titleHtml = [System.Web.HttpUtility]::HtmlEncode($section.Title)
-    $itemsHtml = ($section.Items | ForEach-Object {
-      '- ' + [System.Web.HttpUtility]::HtmlEncode($_)
-    }) -join "<br/>`n"
+  if ($sendMail) {
+    $sectionHtmlParts = foreach ($section in $validSections) {
+      $titleHtml = [System.Web.HttpUtility]::HtmlEncode($section.Title)
+      $itemsHtml = ($section.Items | ForEach-Object {
+        '- ' + [System.Web.HttpUtility]::HtmlEncode($_)
+      }) -join "<br/>`n"
 
-    '<div style="margin-bottom:16px;"><p style="margin:0 0 6px 0;font-size:11pt;font-weight:bold;color:#003366;">{0}</p><p style="margin:0 0 12px 24px;font-size:11pt;">{1}</p></div>' -f $titleHtml, $itemsHtml
-  }
+      '<div style="margin-bottom:16px;"><p style="margin:0 0 6px 0;font-size:11pt;font-weight:bold;color:#003366;">{0}</p><p style="margin:0 0 12px 24px;font-size:11pt;">{1}</p></div>' -f $titleHtml, $itemsHtml
+    }
 
-  $taskHtml = $sectionHtmlParts -join "`n"
+    $taskHtml = $sectionHtmlParts -join "`n"
 
-  $finalHtml = @"
+    $finalHtml = @"
 <!doctype html>
 <html lang="en">
 <head>
@@ -250,41 +475,45 @@ try {
 </html>
 "@
 
-  $tempHtml = Join-Path $Env:TEMP "worklog-composed-no-bullets.html"
-  $finalHtml | Out-File -FilePath $tempHtml -Encoding UTF8
-  Write-Log ("Composed HTML saved to: {0}" -f $tempHtml)
+    $tempHtml = Join-Path $Env:TEMP "worklog-composed-no-bullets.html"
+    $finalHtml | Out-File -FilePath $tempHtml -Encoding UTF8
+    Write-Log ("Composed HTML saved to: {0}" -f $tempHtml)
 
-  $outlook = $null
-  $mail = $null
-  try {
-    Write-Log "Creating Outlook COM object..."
-    $outlook = New-Object -ComObject Outlook.Application
-    $mail = $outlook.CreateItem(0)
+    $outlook = $null
+    $mail = $null
+    try {
+      Write-Log "Creating Outlook COM object..."
+      $outlook = New-Object -ComObject Outlook.Application
+      $mail = $outlook.CreateItem(0)
 
-    $mail.To = $To
-    if ($Cc) { $mail.CC = $Cc }
-    if ($Bcc) { $mail.BCC = $Bcc }
-    $mail.Subject = "$SubjectPrefix $($today.ToString('dd MMM yyyy'))"
-    $mail.HTMLBody = $finalHtml
+      $mail.To = $To
+      if ($Cc) { $mail.CC = $Cc }
+      if ($Bcc) { $mail.BCC = $Bcc }
+      $mail.Subject = "$SubjectPrefix $($today.ToString('dd MMM yyyy'))"
+      $mail.HTMLBody = $finalHtml
 
-    if ($PreviewOnly) {
-      Write-Log "PreviewOnly mode requested. Skipping send but continuing with summary update."
+      if ($PreviewOnly) {
+        Write-Log "PreviewOnly mode requested. Skipping send but continuing with summary update."
+      }
+      else {
+        Write-Log ("Sending mail to {0}..." -f $To)
+        $mail.Send()
+        Write-Log "Mail sent successfully. Check Sent Items."
+      }
     }
-    else {
-      Write-Log ("Sending mail to {0}..." -f $To)
-      $mail.Send()
-      Write-Log "Mail sent successfully. Check Sent Items."
+    finally {
+      if ($mail) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($mail) }
+      if ($outlook) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($outlook) }
     }
   }
-  finally {
-    if ($mail) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($mail) }
-    if ($outlook) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($outlook) }
+  else {
+    Write-Log "Skipping Outlook email step because no actionable items were found."
   }
 
   try {
-    Write-Log "Updating summary workbook..."
-    $rowsAdded = Update-SummaryWorkbook -Path $SummaryPath -LogDate $today -Sections $validSections
-    Write-Log ("Summary workbook updated. Rows added: {0}" -f $rowsAdded)
+    Write-Log "Synchronizing summary workbook (dedupe + backfill)..."
+    $totalEntries = Sync-SummaryWorkbook -Path $SummaryPath -Today $today -TodaySections $validSections -WorkLogsBase $WorkLogsBase
+    Write-Log ("Summary workbook synchronization complete. Total entries now: {0}" -f $totalEntries)
   }
   catch {
     Write-Log ("ERROR updating summary workbook: {0}" -f $_.Exception.Message)
