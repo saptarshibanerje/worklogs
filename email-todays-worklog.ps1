@@ -43,13 +43,13 @@ function ConvertTo-DateKey {
   return $Date.ToString('yyyy-MM-dd')
 }
 
-function Parse-WorkLogSections {
+function Get-WorkLogSections {
   param(
     [string]$Content
   )
 
   $headingRegex = [regex]'^(#{2,6})\s+(.*\S)'
-  $bulletRegex = [regex]'^\s*(?:-|(?:\d+\.)|[a-zA-Z]\.)\s*(.+)$'
+  $bulletRegex = [regex]'^\s*(?<marker>-|(?:\d+\.)|(?:[a-zA-Z]\.))\s*(?<text>.+)$'
   $sections = New-Object System.Collections.Generic.List[object]
   $currentSection = $null
 
@@ -70,8 +70,27 @@ function Parse-WorkLogSections {
 
     $bulletMatch = $bulletRegex.Match($rawLine)
     if ($bulletMatch.Success) {
-      $itemText = $bulletMatch.Groups[1].Value.Trim()
-      if ($itemText) { $currentSection.Items.Add($itemText) }
+      $indentMatch = [regex]::Match($rawLine, '^\s*')
+      $indentLength = $indentMatch.Value.Length
+      $marker = $bulletMatch.Groups['marker'].Value
+      $itemText = $bulletMatch.Groups['text'].Value.Trim()
+      if (-not $itemText) { continue }
+
+      $formatted = if ($marker -eq '-') { $itemText } else { "{0} {1}" -f $marker, $itemText }
+
+      if ($indentLength -gt 0 -and $currentSection.Items.Count -gt 0) {
+        $lastIndex = $currentSection.Items.Count - 1
+        $currentSection.Items[$lastIndex] = $currentSection.Items[$lastIndex] + "`n  " + $formatted
+      }
+      else {
+        $currentSection.Items.Add($formatted)
+      }
+      continue
+    }
+
+    if ($trimmed -ne '' -and $currentSection.Items.Count -gt 0) {
+      $lastIndex = $currentSection.Items.Count - 1
+      $currentSection.Items[$lastIndex] = $currentSection.Items[$lastIndex] + " " + $trimmed
     }
   }
 
@@ -93,7 +112,7 @@ function Get-SectionsFromWorkLogFile {
     return @()
   }
 
-  return (Parse-WorkLogSections -Content $content)
+  return (Get-WorkLogSections -Content $content)
 }
 
 function Convert-SectionsToRecords {
@@ -156,8 +175,52 @@ function Sync-SummaryWorkbook {
   $workbook = $null
   $worksheet = $null
   $xlUp = -4162
-  $existingDateKeys = New-Object System.Collections.Generic.HashSet[string]
   $recordsByDate = New-Object 'System.Collections.Generic.SortedDictionary[datetime,System.Collections.Generic.List[pscustomobject]]'
+  $todayKey = ConvertTo-DateKey -Date $Today
+  $fileMap = Get-WorkLogFileMap -BasePath $WorkLogsBase
+
+  if ($fileMap.Count -eq 0) {
+    Write-Log "No worklog markdown files found. Summary workbook will be cleared."
+  }
+
+  foreach ($dateKey in ($fileMap.Keys | Sort-Object)) {
+    $filePath = $fileMap[$dateKey]
+    $usingCachedSections = $false
+    if ($dateKey -eq $todayKey -and $TodaySections) {
+      $sections = $TodaySections
+      $usingCachedSections = $true
+      Write-Log ("Refreshing summary for {0} using in-memory sections." -f $dateKey)
+    }
+    else {
+      Write-Log ("Processing summary for {0} from file {1}" -f $dateKey, $filePath)
+      $sections = Get-SectionsFromWorkLogFile -Path $filePath
+    }
+
+    if (-not $sections -or $sections.Count -eq 0) {
+      Write-Log ("No bullet entries found for {0}; skipping." -f $dateKey)
+      continue
+    }
+
+    $logDate = [DateTime]::ParseExact($dateKey, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture).Date
+    $records = Convert-SectionsToRecords -LogDate $logDate -Sections $sections
+    if ($records.Count -eq 0) {
+      Write-Log ("Parsed sections for {0} but found no bullet entries to record." -f $dateKey)
+      continue
+    }
+
+    $recordsByDate[$logDate] = New-Object System.Collections.Generic.List[pscustomobject]
+    foreach ($record in $records) {
+      $recordsByDate[$logDate].Add($record)
+    }
+
+    $sourceNote = if ($usingCachedSections) { 'in-memory data' } else { 'from file' }
+    Write-Log ("Captured {0} entries for {1} ({2})." -f $records.Count, $dateKey, $sourceNote)
+  }
+
+  $totalEntries = 0
+  foreach ($kvp in $recordsByDate.GetEnumerator()) {
+    $totalEntries += $kvp.Value.Count
+  }
 
   try {
     $excel = New-Object -ComObject Excel.Application
@@ -170,7 +233,6 @@ function Sync-SummaryWorkbook {
     }
 
     $createdNew = $false
-
     if ((Test-Path -LiteralPath $Path -PathType Leaf) -and ((Get-Item -LiteralPath $Path).Length -gt 0)) {
       try {
         Write-Log ("Opening existing summary workbook: {0}" -f $Path)
@@ -214,130 +276,12 @@ function Sync-SummaryWorkbook {
     }
 
     $lastRow = $worksheet.Cells.Item($worksheet.Rows.Count, 1).End($xlUp).Row
-    if ($lastRow -gt 1) {
-      $endAddress = "C$lastRow"
-      $dataRange = $worksheet.Range("A2", $endAddress)
-      $data = $dataRange.Value2
-
-      if ($null -ne $data) {
-        if ($data -is [System.Array]) {
-          if ($data.Rank -eq 1) {
-            $cols = $data.Length
-            $matrix = New-Object 'object[,]' 1, $cols
-            for ($c = 0; $c -lt $cols; $c++) {
-              $matrix[0, $c] = $data[$c]
-            }
-            $data = $matrix
-          }
-        }
-        else {
-          $matrix = New-Object 'object[,]' 1, 1
-          $matrix[0, 0] = $data
-          $data = $matrix
-        }
-
-        $rowLower = $data.GetLowerBound(0)
-        $rowUpper = $data.GetUpperBound(0)
-        $colLower = $data.GetLowerBound(1)
-
-        for ($row = $rowLower; $row -le $rowUpper; $row++) {
-          $dateValue = $data.GetValue($row, $colLower)
-          if ($null -eq $dateValue) { continue }
-
-          if ($dateValue -is [double]) {
-            $dateValue = [DateTime]::FromOADate($dateValue)
-          } elseif ($dateValue -is [string]) {
-            try {
-              $dateValue = [DateTime]::Parse($dateValue, [System.Globalization.CultureInfo]::InvariantCulture)
-            }
-            catch {
-              continue
-            }
-          } else {
-            $dateValue = [datetime]$dateValue
-          }
-
-          $sectionValue = $data.GetValue($row, $colLower + 1)
-          $entryValue = $data.GetValue($row, $colLower + 2)
-          $dateOnly = $dateValue.Date
-          $dateKey = ConvertTo-DateKey -Date $dateOnly
-
-          $existingDateKeys.Add($dateKey) | Out-Null
-          if (-not $recordsByDate.ContainsKey($dateOnly)) {
-            $recordsByDate[$dateOnly] = New-Object System.Collections.Generic.List[pscustomobject]
-          }
-
-          $recordsByDate[$dateOnly].Add([pscustomobject]@{
-            Date = $dateOnly
-            DateKey = $dateKey
-            Section = [string]$sectionValue
-            Entry = [string]$entryValue
-          })
-        }
-      }
-    }
-
-    $todayKey = ConvertTo-DateKey -Date $Today
-    if ($recordsByDate.ContainsKey($Today.Date)) {
-      $removedCount = $recordsByDate[$Today.Date].Count
-      Write-Log ("Removing {0} existing entries for {1} before refresh." -f $removedCount, $todayKey)
-      $recordsByDate.Remove($Today.Date) | Out-Null
-    }
-
-    $fileMap = Get-WorkLogFileMap -BasePath $WorkLogsBase
-    $missingDateKeys = @()
-    foreach ($kvp in $fileMap.GetEnumerator()) {
-      if (-not $existingDateKeys.Contains($kvp.Key)) {
-        $missingDateKeys += $kvp.Key
-      }
-    }
-
-    $missingDateKeys = $missingDateKeys | Sort-Object
-    foreach ($dateKey in $missingDateKeys) {
-      $filePath = $fileMap[$dateKey]
-      Write-Log ("Backfilling summary for {0} from file {1}" -f $dateKey, $filePath)
-      $sections = Get-SectionsFromWorkLogFile -Path $filePath
-      if (-not $sections -or $sections.Count -eq 0) {
-        Write-Log ("No bullet entries found in {0}; skipping backfill." -f $filePath)
-        continue
-      }
-
-      $logDate = [DateTime]::ParseExact($dateKey, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
-      $records = Convert-SectionsToRecords -LogDate $logDate -Sections $sections
-      if ($records.Count -eq 0) {
-        Write-Log ("Parsed sections for {0} but found no bullet entries to record." -f $dateKey)
-        continue
-      }
-
-      if (-not $recordsByDate.ContainsKey($logDate.Date)) {
-        $recordsByDate[$logDate.Date] = New-Object System.Collections.Generic.List[pscustomobject]
-      }
-
-      foreach ($record in $records) {
-        $recordsByDate[$logDate.Date].Add($record)
-      }
-
-      $existingDateKeys.Add($dateKey) | Out-Null
-    }
-
-    $todayRecords = Convert-SectionsToRecords -LogDate $Today -Sections $TodaySections
-    Write-Log ("Adding {0} entries for today's log ({1})." -f $todayRecords.Count, $todayKey)
-    $recordsByDate[$Today.Date] = New-Object System.Collections.Generic.List[pscustomobject]
-    foreach ($record in $todayRecords) {
-      $recordsByDate[$Today.Date].Add($record)
-    }
-    $existingDateKeys.Add($todayKey) | Out-Null
-
-    $totalEntries = 0
-    foreach ($kvp in $recordsByDate.GetEnumerator()) {
-      $totalEntries += $kvp.Value.Count
-    }
-
-    Write-Log ("Writing {0} total entries back to summary workbook." -f $totalEntries)
-
+    if ($lastRow -lt 1) { $lastRow = 1 }
     if ($lastRow -gt 1) {
       $worksheet.Range("A2", "C$lastRow").ClearContents() | Out-Null
     }
+
+    Write-Log ("Writing {0} total entries back to summary workbook." -f $totalEntries)
 
     if ($totalEntries -gt 0) {
       $dataArray = New-Object 'object[,]' $totalEntries, 3
@@ -398,7 +342,7 @@ try {
   try { Add-Type -AssemblyName System.Web -ErrorAction Stop } catch {}
 
   Write-Log "Parsing worklog content for bullet sections..."
-  $sections = Parse-WorkLogSections -Content $content
+  $sections = Get-WorkLogSections -Content $content
   $validSections = New-Object System.Collections.Generic.List[object]
   foreach ($section in $sections) {
     if ($section.Items.Count -gt 0) {
