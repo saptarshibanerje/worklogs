@@ -3,7 +3,7 @@
 
 # --- Configuration ---
 $scriptPath   = "E:\SAPTARSHI BANERJEE\PERSONAL\PROJECT\OTHERS\WORKLOGS\email-todays-worklog.ps1"
-$recipient    = "siddhesh@ibps.in"   # Default recipient email
+$recipient    = "siddhesh@ibps.in;bhoopendra.singh@ibps.in"   # Default recipient email
 $shortcutName = "Send Work Log"
 # ----------------------
 
